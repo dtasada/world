@@ -6,13 +6,15 @@ const noise = @import("noise.zig");
 
 const NCOLS: usize = 21601;
 const NROWS: usize = 10801;
-const SPHERE_RES: i32 = 250;
+
+const NUM_SEGMENTS: usize = 32;
+const LAT_RES: i32 = @intFromFloat(@sqrt(@as(f64, @floatFromInt(64000 * NUM_SEGMENTS / 2))));
+const LON_RES: i32 = @intFromFloat(64000.0 / @as(f64, @floatFromInt(LAT_RES + 1)) - 1);
 
 const Game = struct {
     alloc: std.mem.Allocator,
     vertices: []f32,
-    left_model: rl.Model,
-    right_model: rl.Model,
+    models: []rl.Model,
     shader: rl.Shader,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, shader: rl.Shader) !Game {
@@ -34,18 +36,19 @@ const Game = struct {
         errdefer alloc.free(vertices_bytes);
         const vertices = std.mem.bytesAsSlice(f32, vertices_bytes);
 
+        const models = try alloc.alloc(rl.Model, NUM_SEGMENTS);
+        errdefer alloc.free(models);
+
         const sphere_radius = 40.0;
-        const left_mesh = try createGlobeMesh(sphere_radius, SPHERE_RES, SPHERE_RES, 0.0, 0.5, vertices);
-        const right_mesh = try createGlobeMesh(sphere_radius, SPHERE_RES, SPHERE_RES, 0.5, 1.0, vertices);
+        for (0..NUM_SEGMENTS) |i| {
+            const u_min = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(NUM_SEGMENTS));
+            const u_max = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(NUM_SEGMENTS));
 
-        var left_model = try rl.Model.fromMesh(left_mesh);
-        var right_model = try rl.Model.fromMesh(right_mesh);
-
-        left_model.materials[0].shader = shader;
-        left_model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture = texture;
-
-        right_model.materials[0].shader = shader;
-        right_model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture = texture;
+            const mesh = try createGlobeMesh(sphere_radius, LAT_RES, LON_RES, u_min, u_max, vertices);
+            models[i] = try rl.Model.fromMesh(mesh);
+            models[i].materials[0].shader = shader;
+            models[i].materials[0].maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture = texture;
+        }
 
         const ambient: [4]f32 = .{ 0.1, 0.1, 0.1, 1.0 };
         rl.setShaderValue(shader, rl.getShaderLocation(shader, "ambient"), &ambient, .vec4);
@@ -53,27 +56,32 @@ const Game = struct {
         return .{
             .alloc = alloc,
             .vertices = vertices,
-            .left_model = left_model,
-            .right_model = right_model,
+            .models = models,
             .shader = shader,
         };
     }
 
     pub fn deinit(self: *Game) void {
-        const tex = self.left_model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture;
+        const tex = self.models[0].materials[0].maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture;
         tex.unload();
-        self.left_model.unload();
-        self.right_model.unload();
+        for (self.models) |m| m.unload();
+        self.alloc.free(self.models);
         self.alloc.free(std.mem.sliceAsBytes(self.vertices));
     }
 
     pub fn update(self: *Game) !void {
-        self.left_model.draw(.zero(), 1.0, .white);
-        self.right_model.draw(.zero(), 1.0, .white);
+        for (self.models) |m| m.draw(.zero(), 1.0, .white);
     }
 };
 
-fn createGlobeMesh(radius: f32, rings: i32, slices: i32, u_min: f32, u_max: f32, heightmap: []const f32) !rl.Mesh {
+fn createGlobeMesh(
+    radius: f32,
+    rings: i32,
+    slices: i32,
+    u_min: f32,
+    u_max: f32,
+    heightmap: []const f32,
+) !rl.Mesh {
     const v_count: usize = @intCast((rings + 1) * (slices + 1));
     const t_count: usize = @intCast(rings * slices * 2);
 
@@ -104,14 +112,14 @@ fn createGlobeMesh(radius: f32, rings: i32, slices: i32, u_min: f32, u_max: f32,
 
             const u_map = 1.0 - u;
             const v_map = 1.0 - v;
-            const col = @as(usize, @intFromFloat(std.math.clamp(u_map, 0, 1) * @as(f32, @floatFromInt(NCOLS - 1))));
-            const row = @as(usize, @intFromFloat(std.math.clamp(v_map, 0, 1) * @as(f32, @floatFromInt(NROWS - 1))));
+            const col: usize = @intFromFloat(std.math.clamp(u_map, 0, 1) * @as(f32, @floatFromInt(NCOLS - 1)));
+            const row: usize = @intFromFloat(std.math.clamp(v_map, 0, 1) * @as(f32, @floatFromInt(NROWS - 1)));
 
             var h = heightmap[row * NCOLS + col];
             if (h == -99999) h = 0;
 
             const earth_radius: f32 = 6.371e6;
-            const exaggeration = 40.0;
+            const exaggeration = 20.0;
             const elevation = (h / earth_radius) * radius * exaggeration;
 
             const d = radius + elevation;
@@ -130,7 +138,7 @@ fn createGlobeMesh(radius: f32, rings: i32, slices: i32, u_min: f32, u_max: f32,
     }
 
     var k: usize = 0;
-    const s_stride = @as(usize, @intCast(slices + 1));
+    const s_stride: usize = @intCast(slices + 1);
     for (0..@intCast(rings)) |r| {
         for (0..@intCast(slices)) |s| {
             const _i0 = r * s_stride + s;
