@@ -1,2 +1,2 @@
-earth.bin filter=lfs diff=lfs merge=lfs -text
 earth.bmp filter=lfs diff=lfs merge=lfs -text
+earth.bin filter=lfs diff=lfs merge=lfs -text
