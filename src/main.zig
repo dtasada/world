@@ -6,26 +6,22 @@ const noise = @import("noise.zig");
 
 const NCOLS: usize = 21601;
 const NROWS: usize = 10801;
-const SPHERE_RES: i32 = 128;
+const SPHERE_RES: i32 = 250;
 
 const Game = struct {
     alloc: std.mem.Allocator,
     vertices: []f32,
-    map: struct {
-        model: rl.Model,
-    },
-    camera: rl.Camera2D,
+    left_model: rl.Model,
+    right_model: rl.Model,
     shader: rl.Shader,
-    colors: struct {
-        map: []rl.Color,
-        width: usize,
-        height: usize,
-    },
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, shader: rl.Shader) !Game {
-        const color_image = try rl.loadImage("resources/earth.bmp");
+        var color_image = try rl.loadImage("resources/earth.bmp");
         defer color_image.unload();
-        const color_map = try rl.loadImageColors(color_image);
+        color_image.flipHorizontal();
+
+        const texture = try rl.loadTextureFromImage(color_image);
+        rl.setTextureWrap(texture, .repeat);
 
         const vertices_bytes = try std.Io.Dir.cwd().readFileAllocOptions(
             io,
@@ -38,100 +34,123 @@ const Game = struct {
         errdefer alloc.free(vertices_bytes);
         const vertices = std.mem.bytesAsSlice(f32, vertices_bytes);
 
-        var self: Game = .{
-            .alloc = alloc,
-            .vertices = vertices,
-            .map = .{ .model = undefined },
-            .camera = .{
-                .offset = .zero(),
-                .rotation = 0.0,
-                .target = .zero(),
-                .zoom = 1.0,
-            },
-            .shader = shader,
-            .colors = .{
-                .map = color_map,
-                .width = @intCast(color_image.width),
-                .height = @intCast(color_image.height),
-            },
-        };
+        const sphere_radius = 40.0;
+        const left_mesh = try createGlobeMesh(sphere_radius, SPHERE_RES, SPHERE_RES, 0.0, 0.5, vertices);
+        const right_mesh = try createGlobeMesh(sphere_radius, SPHERE_RES, SPHERE_RES, 0.5, 1.0, vertices);
 
-        try self.genMapTexture();
+        var left_model = try rl.Model.fromMesh(left_mesh);
+        var right_model = try rl.Model.fromMesh(right_mesh);
+
+        left_model.materials[0].shader = shader;
+        left_model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture = texture;
+
+        right_model.materials[0].shader = shader;
+        right_model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture = texture;
 
         const ambient: [4]f32 = .{ 0.1, 0.1, 0.1, 1.0 };
         rl.setShaderValue(shader, rl.getShaderLocation(shader, "ambient"), &ambient, .vec4);
 
-        return self;
+        return .{
+            .alloc = alloc,
+            .vertices = vertices,
+            .left_model = left_model,
+            .right_model = right_model,
+            .shader = shader,
+        };
     }
 
     pub fn deinit(self: *Game) void {
-        rl.unloadImageColors(self.colors.map);
-        self.map.model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture.unload();
-        self.map.model.unload();
+        const tex = self.left_model.materials[0].maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture;
+        tex.unload();
+        self.left_model.unload();
+        self.right_model.unload();
         self.alloc.free(std.mem.sliceAsBytes(self.vertices));
     }
 
-    pub fn genMapTexture(self: *Game) !void {
-        var image = try rl.Image.init("resources/earth.bmp");
-        defer image.unload();
+    pub fn update(self: *Game) !void {
+        self.left_model.draw(.zero(), 1.0, .white);
+        self.right_model.draw(.zero(), 1.0, .white);
+    }
+};
 
-        image.flipHorizontal();
+fn createGlobeMesh(radius: f32, rings: i32, slices: i32, u_min: f32, u_max: f32, heightmap: []const f32) !rl.Mesh {
+    const v_count: usize = @intCast((rings + 1) * (slices + 1));
+    const t_count: usize = @intCast(rings * slices * 2);
 
-        const texture = try image.toTexture();
-        rl.setTextureWrap(texture, .repeat);
+    var mesh = std.mem.zeroInit(rl.Mesh, .{
+        .vertexCount = @as(i32, @intCast(v_count)),
+        .triangleCount = @as(i32, @intCast(t_count)),
+    });
 
-        const sphere_radius = 40;
-        const mesh = rl.genMeshSphere(sphere_radius, SPHERE_RES, SPHERE_RES);
+    mesh.vertices = @ptrCast(@alignCast(rl.memAlloc(@intCast(v_count * 3 * @sizeOf(f32)))));
+    mesh.texcoords = @ptrCast(@alignCast(rl.memAlloc(@intCast(v_count * 2 * @sizeOf(f32)))));
+    mesh.normals = @ptrCast(@alignCast(rl.memAlloc(@intCast(v_count * 3 * @sizeOf(f32)))));
+    mesh.indices = @ptrCast(@alignCast(rl.memAlloc(@intCast(t_count * 3 * @sizeOf(u16)))));
 
-        var material = try rl.loadMaterialDefault();
-        material.shader = self.shader;
-        material.maps[@intFromEnum(rl.MaterialMapIndex.albedo)].texture = texture;
+    for (0..@intCast(rings + 1)) |r| {
+        const v = @as(f32, @floatFromInt(r)) / @as(f32, @floatFromInt(rings));
+        const phi = (v - 0.5) * std.math.pi;
+        const sin_phi = std.math.sin(phi);
+        const cos_phi = std.math.cos(phi);
 
-        var model = try rl.Model.fromMesh(mesh);
-        model.materials[0] = material;
+        for (0..@intCast(slices + 1)) |s| {
+            const u_rel = @as(f32, @floatFromInt(s)) / @as(f32, @floatFromInt(slices));
+            const u = u_min + u_rel * (u_max - u_min);
+            const theta = (u - 0.5) * 2.0 * std.math.pi;
 
-        var i: usize = 0;
-        while (i < mesh.vertexCount * 3) : (i += 3) {
-            const norm = rl.Vector3.init(mesh.vertices[i + 0], mesh.vertices[i + 1], mesh.vertices[i + 2]).normalize();
+            const nx = cos_phi * std.math.cos(theta);
+            const ny = sin_phi;
+            const nz = cos_phi * std.math.sin(theta);
 
-            const u = std.math.atan2(norm.z, norm.x) / (2.0 * std.math.pi) + 0.5;
-            const v = std.math.asin(norm.y) / std.math.pi + 0.5;
+            const u_map = 1.0 - u;
+            const v_map = 1.0 - v;
+            const col = @as(usize, @intFromFloat(std.math.clamp(u_map, 0, 1) * @as(f32, @floatFromInt(NCOLS - 1))));
+            const row = @as(usize, @intFromFloat(std.math.clamp(v_map, 0, 1) * @as(f32, @floatFromInt(NROWS - 1))));
 
-            const col: usize = @intFromFloat(@as(f32, @floatFromInt(NCOLS - 1)) * std.math.clamp(1.0 - u, 0.0, 1.0));
-            const row: usize = @intFromFloat(@as(f32, @floatFromInt(NROWS - 1)) * std.math.clamp(v, 0.0, 1.0));
-
-            var h = self.vertices[row * NCOLS + col];
+            var h = heightmap[row * NCOLS + col];
             if (h == -99999) h = 0;
 
             const earth_radius: f32 = 6.371e6;
             const exaggeration = 40.0;
-            const elevation = (h / earth_radius) * sphere_radius * exaggeration;
+            const elevation = (h / earth_radius) * radius * exaggeration;
 
-            const final = norm.scale(sphere_radius + elevation);
+            const d = radius + elevation;
+            const idx = r * @as(usize, @intCast(slices + 1)) + s;
+            mesh.vertices[idx * 3 + 0] = nx * d;
+            mesh.vertices[idx * 3 + 1] = ny * d;
+            mesh.vertices[idx * 3 + 2] = nz * d;
 
-            mesh.vertices[i + 0] = final.x;
-            mesh.vertices[i + 1] = final.y;
-            mesh.vertices[i + 2] = final.z;
+            mesh.normals[idx * 3 + 0] = nx;
+            mesh.normals[idx * 3 + 1] = ny;
+            mesh.normals[idx * 3 + 2] = nz;
 
-            mesh.normals[i + 0] = norm.x;
-            mesh.normals[i + 1] = norm.y;
-            mesh.normals[i + 2] = norm.z;
-
-            mesh.texcoords[(i / 3) * 2 + 0] = u;
-            mesh.texcoords[(i / 3) * 2 + 1] = 1.0 - v;
+            mesh.texcoords[idx * 2 + 0] = u;
+            mesh.texcoords[idx * 2 + 1] = 1.0 - v;
         }
-
-        rl.updateMeshBuffer(mesh, 0, mesh.vertices, mesh.vertexCount * 3 * @sizeOf(f32), 0);
-        rl.updateMeshBuffer(mesh, 1, mesh.texcoords, mesh.vertexCount * 2 * @sizeOf(f32), 0);
-        rl.updateMeshBuffer(mesh, 2, mesh.normals, mesh.vertexCount * 3 * @sizeOf(f32), 0);
-
-        self.map.model = model;
     }
 
-    pub fn update(self: *Game) !void {
-        self.map.model.draw(.zero(), 1.0, .white);
+    var k: usize = 0;
+    const s_stride = @as(usize, @intCast(slices + 1));
+    for (0..@intCast(rings)) |r| {
+        for (0..@intCast(slices)) |s| {
+            const _i0 = r * s_stride + s;
+            const _i1 = _i0 + 1;
+            const _i2 = (r + 1) * s_stride + s;
+            const _i3 = _i2 + 1;
+
+            mesh.indices[k + 0] = @intCast(_i0);
+            mesh.indices[k + 1] = @intCast(_i2);
+            mesh.indices[k + 2] = @intCast(_i1);
+            mesh.indices[k + 3] = @intCast(_i1);
+            mesh.indices[k + 4] = @intCast(_i2);
+            mesh.indices[k + 5] = @intCast(_i3);
+            k += 6;
+        }
     }
-};
+
+    rl.uploadMesh(&mesh, false);
+    return mesh;
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -166,8 +185,7 @@ pub fn main(init: std.process.Init) !void {
     defer game.deinit();
 
     while (!rl.windowShouldClose()) {
-        // if (rl.isMouseButtonDown(.left)) camera.update(.third_person);
-        camera.update(.free);
+        if (rl.isMouseButtonDown(.left)) camera.update(.third_person);
 
         rl.beginDrawing();
         defer rl.endDrawing();
