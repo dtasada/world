@@ -9,13 +9,81 @@ const NROWS: usize = 10801;
 
 const NUM_SEGMENTS: usize = 32;
 const LAT_RES: i32 = @intFromFloat(@sqrt(@as(f64, @floatFromInt(64000 * NUM_SEGMENTS / 2))));
-const LON_RES: i32 = @intFromFloat(64000.0 / @as(f64, @floatFromInt(LAT_RES + 1)) - 1);
+const LON_RES: i32 = @intFromFloat(64e3 / @as(f64, @floatFromInt(LAT_RES + 1)) - 1);
+
+const BorderLine = struct {
+    points: []rl.Vector3,
+};
+
+fn loadBorders(alloc: std.mem.Allocator, io: std.Io, heightmap: []const f32, radius: f32) ![]BorderLine {
+    const file_bytes = try std.Io.Dir.cwd().readFileAlloc(io, "resources/borders.bin", alloc, .limited(10 * 1024 * 1024));
+    defer alloc.free(file_bytes);
+
+    var reader = std.Io.Reader.fixed(file_bytes);
+
+    const total_polylines = try reader.takeInt(u32, .little);
+    const lines = try alloc.alloc(BorderLine, total_polylines);
+    errdefer alloc.free(lines);
+
+    var i: usize = 0;
+    errdefer {
+        for (0..i) |j| alloc.free(lines[j].points);
+        alloc.free(lines);
+    }
+
+    while (i < total_polylines) : (i += 1) {
+        const num_points = try reader.takeInt(u32, .little);
+        const points = try alloc.alloc(rl.Vector3, num_points);
+        errdefer alloc.free(points);
+
+        for (0..num_points) |p_idx| {
+            const lon_bits = try reader.takeInt(u32, .little);
+            const lat_bits = try reader.takeInt(u32, .little);
+            const raw_lon: f32 = @bitCast(lon_bits);
+            const lat: f32 = @bitCast(lat_bits);
+
+            // Mirror longitude horizontally to match the horizontally flipped earth texture and heightmap
+            const lon = -raw_lon;
+
+            // Convert spherical coords to 3D Cartesian
+            const phi = lat * (std.math.pi / 180.0);
+            const theta = lon * (std.math.pi / 180.0);
+            const nx = std.math.cos(phi) * std.math.cos(theta);
+            const ny = std.math.sin(phi);
+            const nz = std.math.cos(phi) * std.math.sin(theta);
+
+            // Map coordinates to heightmap (equirectangular projection)
+            const u = (lon + 180.0) / 360.0;
+            const v = (lat + 90.0) / 180.0;
+            const u_map = 1.0 - u;
+            const v_map = 1.0 - v;
+
+            const col: usize = @intFromFloat(std.math.clamp(u_map, 0.0, 1.0) * @as(f32, @floatFromInt(NCOLS - 1)));
+            const row: usize = @intFromFloat(std.math.clamp(v_map, 0.0, 1.0) * @as(f32, @floatFromInt(NROWS - 1)));
+
+            var h = heightmap[row * NCOLS + col];
+            if (h == -99999) h = 0;
+
+            const earth_radius: f32 = 6.371e6;
+            const exaggeration = 20.0;
+            const elevation = (h / earth_radius) * radius * exaggeration;
+
+            // Offset slightly to float borders above the terrain to prevent depth fighting/clipping
+            const d = radius + elevation + 0.08;
+            points[p_idx] = rl.Vector3.init(nx * d, ny * d, nz * d);
+        }
+        lines[i] = .{ .points = points };
+    }
+
+    return lines;
+}
 
 const Game = struct {
     alloc: std.mem.Allocator,
     vertices: []f32,
     models: []rl.Model,
     shader: rl.Shader,
+    border_lines: []BorderLine,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io, shader: rl.Shader) !Game {
         var color_image = try rl.loadImage("resources/earth.bmp");
@@ -53,11 +121,18 @@ const Game = struct {
         const ambient: [4]f32 = .{ 0.1, 0.1, 0.1, 1.0 };
         rl.setShaderValue(shader, rl.getShaderLocation(shader, "ambient"), &ambient, .vec4);
 
+        const border_lines = try loadBorders(alloc, io, vertices, sphere_radius);
+        errdefer {
+            for (border_lines) |line| alloc.free(line.points);
+            alloc.free(border_lines);
+        }
+
         return .{
             .alloc = alloc,
             .vertices = vertices,
             .models = models,
             .shader = shader,
+            .border_lines = border_lines,
         };
     }
 
@@ -67,10 +142,25 @@ const Game = struct {
         for (self.models) |m| m.unload();
         self.alloc.free(self.models);
         self.alloc.free(std.mem.sliceAsBytes(self.vertices));
+
+        for (self.border_lines) |line| {
+            self.alloc.free(line.points);
+        }
+        self.alloc.free(self.border_lines);
     }
 
     pub fn update(self: *Game) !void {
         for (self.models) |m| m.draw(.zero(), 1.0, .white);
+
+        // Draw country borders in glowing neon sky-blue
+        const border_color = rl.Color.init(0, 200, 255, 180);
+        for (self.border_lines) |line| {
+            if (line.points.len < 2) continue;
+            var i: usize = 0;
+            while (i < line.points.len - 1) : (i += 1) {
+                rl.drawLine3D(line.points[i], line.points[i + 1], border_color);
+            }
+        }
     }
 };
 
